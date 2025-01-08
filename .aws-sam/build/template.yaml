@@ -1,0 +1,254 @@
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name:
+        Fn::Sub:
+        - ${ResourceName} From Stack ${AWS::StackName}
+        - ResourceName: Api
+      StageName: Prod
+      DefinitionBody:
+        openapi: '3.0'
+        info: {}
+        paths:
+          /:
+            get:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri:
+                  Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetItemsFunction.Arn}/invocations
+              responses: {}
+            post:
+              responses:
+                '200':
+                  description: default OK response
+              x-amazon-apigateway-integration:
+                credentials:
+                  Fn::GetAtt:
+                  - ApiToStateMachineRole
+                  - Arn
+                httpMethod: POST
+                type: aws
+                uri:
+                  Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}:states:action/StartExecution
+                responses:
+                  default:
+                    statusCode: 200
+                requestTemplates:
+                  application/json:
+                    Fn::Sub: "{\n  \"input\": \"$util.escapeJavaScript($input.json('$'))\"\
+                      ,\n  \"name\": \"$context.requestId\",\n  \"stateMachineArn\"\
+                      : \"${StateMachine}\"\n}"
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+      Cors:
+        MaxAge: 5
+  GetItemsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description:
+        Fn::Sub:
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: GetItemsFunction
+      CodeUri: GetItemsFunction
+      Handler: index.handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 30
+      Tracing: Active
+      Architectures:
+      - arm64
+      Events:
+        ApiGET:
+          Type: Api
+          Properties:
+            Path: /
+            Method: GET
+            RestApiId:
+              Ref: Api
+      Environment:
+        Variables:
+          TESTITEMSTABLE_TABLE_NAME:
+            Ref: TestItemsTable
+          TESTITEMSTABLE_TABLE_ARN:
+            Fn::GetAtt:
+            - TestItemsTable
+            - Arn
+      Policies:
+      - DynamoDBReadPolicy:
+          TableName:
+            Ref: TestItemsTable
+    Metadata:
+      SamResourceId: GetItemsFunction
+  GetItemsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${GetItemsFunction}
+  TestItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: id
+        AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+      - AttributeName: id
+        KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+  StateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Definition:
+        StartAt: LambdaTask
+        States:
+          LambdaTask:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              Payload.$: $
+              FunctionName: ${LambdaFunction1}
+            End: true
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+        - CloudWatchLogsLogGroup:
+            LogGroupArn:
+              Fn::GetAtt:
+              - StateMachineLogGroup
+              - Arn
+      Policies:
+      - AWSXrayWriteOnlyAccess
+      - Statement:
+        - Effect: Allow
+          Action:
+          - logs:CreateLogDelivery
+          - logs:GetLogDelivery
+          - logs:UpdateLogDelivery
+          - logs:DeleteLogDelivery
+          - logs:ListLogDeliveries
+          - logs:PutResourcePolicy
+          - logs:DescribeResourcePolicies
+          - logs:DescribeLogGroups
+          Resource: '*'
+      - LambdaInvokePolicy:
+          FunctionName:
+            Ref: PostItemFunction
+      Tracing:
+        Enabled: true
+      Type: STANDARD
+      DefinitionSubstitutions:
+        LambdaFunction1:
+          Fn::GetAtt:
+          - PostItemFunction
+          - Arn
+      Events:
+        ApiPOST:
+          Type: Api
+          Properties:
+            Path: /
+            Method: POST
+            RestApiId:
+              Ref: Api
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub:
+        - /aws/vendedlogs/states/${AWS::StackName}-${ResourceId}-Logs
+        - ResourceId: StateMachine
+  ApiToStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action: sts:AssumeRole
+          Principal:
+            Service:
+              Fn::Sub: apigateway.${AWS::URLSuffix}
+      Policies:
+      - PolicyName: ExecuteStateMachine
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: states:StartExecution
+            Resource:
+              Fn::GetAtt:
+              - StateMachine
+              - Arn
+  PostItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description:
+        Fn::Sub:
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: PostItemFunction
+      CodeUri: PostItemFunction
+      Handler: index.handler
+      Runtime: python3.13
+      MemorySize: 3008
+      Timeout: 30
+      Tracing: Active
+      Architectures:
+      - arm64
+      Environment:
+        Variables:
+          TESTITEMSTABLE_TABLE_NAME:
+            Ref: TestItemsTable
+          TESTITEMSTABLE_TABLE_ARN:
+            Fn::GetAtt:
+            - TestItemsTable
+            - Arn
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: TestItemsTable
+    Metadata:
+      SamResourceId: PostItemFunction
+  PostItemFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${PostItemFunction}
+  TriggeredFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description:
+        Fn::Sub:
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: TriggeredFunction
+      CodeUri: TriggeredFunction
+      Handler: index.handler
+      Runtime: python3.13
+      MemorySize: 3008
+      Timeout: 30
+      Tracing: Active
+      Events:
+        TestItemsTable:
+          Type: DynamoDB
+          Properties:
+            Stream:
+              Fn::GetAtt:
+              - TestItemsTable
+              - StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 1
+      Architectures:
+      - arm64
+    Metadata:
+      SamResourceId: TriggeredFunction
+  TriggeredFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${TriggeredFunction}
